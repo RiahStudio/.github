@@ -1,0 +1,147 @@
+# Riah Studio — run one pro tip against the calling repo, report only.
+#
+# Called from a project repo (see pro-tips/README.md). Runs Claude Code with the tip's
+# prompt, read-only apart from its report file, then posts the report as an issue in
+# that repo and attaches it to the run. Without an ANTHROPIC_API_KEY secret it skips
+# with a warning, so a repo can add the caller before the key exists.
+
+name: Pro tip audit
+
+on:
+  workflow_call:
+    inputs:
+      tip:
+        description: "Tip file name in pro-tips/, without .md (e.g. implicit-state-machines)"
+        type: string
+        required: true
+      library_ref:
+        description: "Branch or tag of RiahStudio/.github to read the tip from"
+        type: string
+        default: main
+      model:
+        description: "Claude model id (blank = the action's default)"
+        type: string
+        default: ""
+      open_issue:
+        description: "Post the report as an issue in the calling repo"
+        type: boolean
+        default: true
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write
+    env:
+      TIP: ${{ inputs.tip }}
+      REPORT: .pro-tip-report/report.md
+    steps:
+      - name: Check inputs and key
+        id: gate
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          # Tip names become a file path: letters, digits and dashes only.
+          if ! [[ "$TIP" =~ ^[a-z0-9-]+$ ]]; then
+            echo "::error::Bad tip name '$TIP' (use lowercase letters, digits and dashes)."
+            exit 1
+          fi
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::warning::ANTHROPIC_API_KEY is not set for this repo or organization. Skipping the '$TIP' audit."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the project
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Check out the tip library
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: RiahStudio/.github
+          ref: ${{ inputs.library_ref }}
+          path: .pro-tips-lib
+          sparse-checkout: pro-tips
+
+      - name: Build the prompt
+        if: steps.gate.outputs.run == 'true'
+        id: prompt
+        run: |
+          f=".pro-tips-lib/pro-tips/$TIP.md"
+          if [ ! -f "$f" ]; then
+            echo "::error::No tip named '$TIP' in RiahStudio/.github pro-tips/."
+            exit 1
+          fi
+          body=$(awk '/<!-- prompt:end -->/{p=0} p{print} /<!-- prompt:start -->/{p=1}' "$f")
+          if [ -z "$(printf '%s' "$body" | tr -d '[:space:]')" ]; then
+            echo "::error::$f has no text between the prompt:start and prompt:end markers."
+            exit 1
+          fi
+          rm -rf .pro-tips-lib   # keep the library out of the audited tree
+          mkdir -p .pro-tip-report
+          {
+            echo "text<<PRO_TIP_EOF"
+            printf '%s\n\n' "$body"
+            echo "Write your full report as Markdown to the file $REPORT and nowhere else."
+            echo "PRO_TIP_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run the audit
+        if: steps.gate.outputs.run == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          # Read and search the code, write the one report. No shell, no web.
+          claude_args: >-
+            --allowedTools Read,Glob,Grep,Write
+            --disallowedTools Bash,WebFetch,WebSearch
+            --max-turns 80
+            ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}
+
+      - name: Check the report
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if [ ! -s "$REPORT" ]; then
+            echo "::error::The audit finished without writing a report."
+            exit 1
+          fi
+          cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attach the report
+        if: steps.gate.outputs.run == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pro-tip-${{ inputs.tip }}-${{ github.run_number }}
+          path: .pro-tip-report/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Post the report as an issue
+        if: steps.gate.outputs.run == 'true' && inputs.open_issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "Automated **$TIP** audit, $(date -u +%Y-%m-%d). Report only: nothing in the repo was changed."
+            echo "Tip and how to fix a finding: https://github.com/RiahStudio/.github/blob/main/pro-tips/$TIP.md · Run: $RUN_URL"
+            echo
+            echo "---"
+            echo
+            head -c 60000 "$REPORT"
+            [ "$(wc -c < "$REPORT")" -gt 60000 ] && printf '\n\n_(Cut short here. The full report is attached to the run.)_\n'
+            true
+          } > issue.md
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Pro tip audit: $TIP ($(date -u +%Y-%m-%d))" \
+            --body-file issue.md
